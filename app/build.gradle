@@ -1,0 +1,65 @@
+plugins {
+    id 'com.android.application'
+}
+
+// CI sets these; local builds fall back to version 1 and no release signing.
+def buildNumber = (System.getenv('GITHUB_RUN_NUMBER') ?: '1') as Integer
+def releaseStore = System.getenv('KEYSTORE_FILE')
+def hasReleaseKey = releaseStore != null && !releaseStore.isEmpty() && file(releaseStore).exists()
+
+android {
+    namespace 'io.github.halfark.mosquitohunter'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'io.github.halfark.mosquitohunter'
+        minSdk 26
+        targetSdk 36
+        versionCode buildNumber
+        versionName "1.0.${buildNumber}"
+    }
+
+    signingConfigs {
+        // Shared, non-secret key so test builds can be installed over each other.
+        debug {
+            storeFile rootProject.file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+        if (hasReleaseKey) {
+            release {
+                storeFile file(releaseStore)
+                storePassword System.getenv('KEYSTORE_PASSWORD')
+                keyAlias System.getenv('KEY_ALIAS')
+                keyPassword System.getenv('KEY_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasReleaseKey) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    // The game is a web page; the same folder is served by GitHub Pages.
+    sourceSets {
+        main {
+            assets.srcDirs = ['../docs']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}

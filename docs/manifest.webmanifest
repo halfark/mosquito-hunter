@@ -1,0 +1,14 @@
+{
+  "name": "Mosquito Hunter",
+  "short_name": "Mosquito",
+  "description": "AR camera game: find and shoot the mosquitoes around you.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#0b1a12",
+  "theme_color": "#0b1a12",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b1a12">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<title>Mosquito Hunter</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b1a12; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+    touch-action: none; overscroll-behavior: none; }
+  #cam, #game { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #cam { object-fit: cover; background: radial-gradient(circle at 50% 40%, #24523a, #0b1a12); }
+  #hud { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between;
+    align-items: center; padding: calc(env(safe-area-inset-top, 0px) + 10px) 14px 10px;
+    font-weight: 700; font-size: 18px; text-shadow: 0 1px 4px #000; pointer-events: none; }
+  #hud span { background: rgba(0,0,0,.35); padding: 4px 10px; border-radius: 999px; }
+  .panel { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; padding: 24px; text-align: center;
+    background: rgba(8, 20, 14, .86); }
+  .panel h1 { margin: 0; font-size: 38px; letter-spacing: .5px; }
+  .panel p { margin: 0; max-width: 320px; line-height: 1.45; color: #cfe6d8; font-size: 16px; }
+  .big { font-size: 56px; font-weight: 800; color: #ffd84a; }
+  button { font: inherit; font-weight: 800; font-size: 20px; color: #0b1a12; background: #ffd84a;
+    border: 0; border-radius: 999px; padding: 16px 44px; margin-top: 8px; touch-action: manipulation; }
+  button:active { transform: scale(.96); }
+  .hidden { display: none !important; }
+  #note { font-size: 13px; color: #9fbfae; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="game"></canvas>
+
+<div id="hud" class="hidden">
+  <span id="score">0</span>
+  <span id="wave">Wave 1</span>
+  <span id="lives">♥♥♥</span>
+</div>
+
+<div id="start" class="panel">
+  <h1>🦟 Mosquito Hunter</h1>
+  <p>Mosquitoes are hiding all around you. Turn your phone to find them, line one up in the crosshair and tap to shoot — before it bites.</p>
+  <p id="best"></p>
+  <button id="play">Start hunting</button>
+  <p id="note">Needs camera access. Sound on for the buzz.</p>
+</div>
+
+<div id="over" class="panel hidden">
+  <h1>Bitten!</h1>
+  <div class="big" id="final">0</div>
+  <p id="stats"></p>
+  <button id="again">Play again</button>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const cam = $('cam'), cv = $('game'), ctx = cv.getContext('2d');
+  const DEG = Math.PI / 180, TAU = Math.PI * 2;
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  // ---------- storage (may be unavailable) ----------
+  let best = 0;
+  try { best = +localStorage.getItem('mh_best') || 0; } catch (e) {}
+  const saveBest = () => { try { localStorage.setItem('mh_best', best); } catch (e) {} };
+  const showBest = () => { $('best').textContent = best ? 'Best score: ' + best : ''; };
+  showBest();
+
+  // ---------- canvas sizing ----------
+  let W = 0, H = 0, focal = 600;
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    focal = Math.max(W, H) / (2 * Math.tan(32 * DEG));   // ~64° along the long side
+  }
+  addEventListener('resize', resize); resize();
+
+  // ---------- device orientation ----------
+  // R maps device coords -> world coords (x east, y north, z up). Default: phone held upright, facing north.
+  let R = [1,0,0, 0,0,-1, 0,1,0];
+  let gyro = false;
+  function onOrient(e) {
+    if (e.alpha == null || e.beta == null || e.gamma == null) return;
+    gyro = true;
+    const a = e.alpha * DEG, b = e.beta * DEG, g = e.gamma * DEG;
+    const cA = Math.cos(a), sA = Math.sin(a), cB = Math.cos(b), sB = Math.sin(b),
+          cG = Math.cos(g), sG = Math.sin(g);
+    R = [cA*cG - sA*sB*sG, -cB*sA, cG*sA*sB + cA*sG,
+         cG*sA + cA*sB*sG,  cA*cB, sA*sG - cA*cG*sB,
+         -cB*sG,            sB,    cB*cG];
+  }
+  function screenAngle() {
+    return ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * DEG;
+  }
+  // world -> view coords (x right, y up, z toward the player; in front means z < 0)
+  function toView(w) {
+    const dx = R[0]*w[0] + R[3]*w[1] + R[6]*w[2];
+    const dy = R[1]*w[0] + R[4]*w[1] + R[7]*w[2];
+    const dz = R[2]*w[0] + R[5]*w[1] + R[8]*w[2];
+    const s = screenAngle(), c = Math.cos(s), n = Math.sin(s);
+    return [dx*c - dy*n, dx*n + dy*c, dz];
+  }
+  function headingNow() {            // azimuth the back camera points at
+    return Math.atan2(-R[2], -R[5]);
+  }
+  function elevationNow() {
+    return Math.asin(Math.max(-1, Math.min(1, -R[8])));
+  }
+
+  // ---------- audio ----------
+  let ac = null, buzzGain = null, buzzPan = null, buzzOsc = null;
+  function initAudio() {
+    if (ac) { ac.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    ac = new AC();
+    buzzOsc = ac.createOscillator(); buzzOsc.type = 'sawtooth'; buzzOsc.frequency.value = 520;
+    const lfo = ac.createOscillator(); lfo.frequency.value = 27;
+    const lfoGain = ac.createGain(); lfoGain.gain.value = 45;
+    lfo.connect(lfoGain); lfoGain.connect(buzzOsc.frequency);
+    const filt = ac.createBiquadFilter(); filt.type = 'bandpass'; filt.frequency.value = 900; filt.Q.value = 1.2;
+    buzzGain = ac.createGain(); buzzGain.gain.value = 0;
+    buzzOsc.connect(filt); filt.connect(buzzGain);
+    if (ac.createStereoPanner) { buzzPan = ac.createStereoPanner(); buzzGain.connect(buzzPan); buzzPan.connect(ac.destination); }
+    else buzzGain.connect(ac.destination);
+    buzzOsc.start(); lfo.start();
+  }
+  function noise(dur, freq, vol) {
+    if (!ac) return;
+    const n = Math.floor(ac.sampleRate * dur), buf = ac.createBuffer(1, n, ac.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 2);
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = freq;
+    const g = ac.createGain(); g.gain.value = vol;
+    src.connect(f); f.connect(g); g.connect(ac.destination); src.start();
+  }
+  function tone(f0, f1, dur, vol, type) {
+    if (!ac) return;
+    const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + dur);
+  }
+  const buzz = ms => { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} };
+
+  // ---------- game state ----------
+  let state = 'menu', score = 0, lives = 3, wave = 0, shots = 0, hits = 0;
+  let mozzies = [], splats = [], floats = [];
+  let toSpawn = 0, spawnTimer = 0, waveBanner = 0, flash = 0, hurt = 0, recoil = 0, lastShot = 0;
+  let az0 = 0;
+
+  function spawn() {
+    const speed = 0.55 + wave * 0.09;
+    let az, el;
+    if (gyro) {
+      const spread = Math.min(180, 70 + wave * 25) * DEG;       // later waves come from behind too
+      az = headingNow() + rand(-spread, spread);
+      el = rand(-15, 35) * DEG;
+    } else {
+      az = az0 + rand(-14, 14) * DEG;
+      el = rand(-22, 22) * DEG;
+    }
+    mozzies.push({ az, el, d: rand(8, 11), vaz: 0, vel: 0, speed: speed * rand(.8, 1.2),
+      t: rand(0, 10), turn: 0, baseAz: az, baseEl: el });
+  }
+  function nextWave() {
+    wave++; toSpawn = 2 + wave; spawnTimer = 1.2; waveBanner = 2;
+    $('wave').textContent = 'Wave ' + wave;
+  }
+  function updateHud() {
+    $('score').textContent = score;
+    $('lives').textContent = '♥'.repeat(Math.max(0, lives)) + '♡'.repeat(Math.max(0, 3 - lives));
+  }
+  function startGame() {
+    score = 0; lives = 3; wave = 0; shots = 0; hits = 0;
+    mozzies = []; splats = []; floats = [];
+    az0 = headingNow();
+    state = 'play';
+    $('start').classList.add('hidden'); $('over').classList.add('hidden'); $('hud').classList.remove('hidden');
+    updateHud(); nextWave();
+  }
+  function gameOver() {
+    state = 'over';
+    if (buzzGain) buzzGain.gain.value = 0;
+    if (score > best) { best = score; saveBest(); }
+    $('final').textContent = score;
+    const acc = shots ? Math.round(100 * hits / shots) : 0;
+    $('stats').textContent = `Wave ${wave} · ${hits} swatted · ${acc}% accuracy · best ${best}`;
+    $('hud').classList.add('hidden'); $('over').classList.remove('hidden');
+    showBest();
+  }
+
+  function worldPos(m) {
+    const c = Math.cos(m.el);
+    return [Math.sin(m.az) * c * m.d, Math.cos(m.az) * c * m.d, Math.sin(m.el) * m.d];
+  }
+  function project(m) {
+    const v = toView(worldPos(m));
+    m.v = v;
+    if (v[2] > -0.05) { m.on = false; return; }
+    m.sx = W / 2 + focal * v[0] / -v[2];
+    m.sy = H / 2 - focal * v[1] / -v[2];
+    m.sr = 0.28 * focal / m.d;                 // on-screen body radius
+    m.on = m.sx > -m.sr && m.sx < W + m.sr && m.sy > -m.sr && m.sy < H + m.sr;
+  }
+
+  function update(dt) {
+    if (state !== 'play') return;
+    // spawning
+    if (toSpawn > 0) {
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) { spawn(); toSpawn--; spawnTimer = Math.max(.7, 2.4 - wave * .15); }
+    } else if (mozzies.length === 0) nextWave();
+
+    let nearest = null;
+    for (let i = mozzies.length - 1; i >= 0; i--) {
+      const m = mozzies[i];
+      m.t += dt; m.turn -= dt;
+      if (m.turn <= 0) {                        // erratic flight
+        m.turn = rand(.25, .9);
+        const j = (gyro ? 40 : 16) * DEG / Math.max(2, m.d) * 3;
+        m.vaz = rand(-j, j); m.vel = rand(-j, j) * .6;
+      }
+      m.az += m.vaz * dt; m.el += m.vel * dt;
+      const maxEl = (gyro ? 50 : 24) * DEG, minEl = (gyro ? -25 : -24) * DEG;
+      if (m.el > maxEl) { m.el = maxEl; m.vel = -Math.abs(m.vel); }
+      if (m.el < minEl) { m.el = minEl; m.vel = Math.abs(m.vel); }
+      if (!gyro) {
+        const lim = 15 * DEG, off = m.az - az0;
+        if (off > lim) { m.az = az0 + lim; m.vaz = -Math.abs(m.vaz); }
+        if (off < -lim) { m.az = az0 - lim; m.vaz = Math.abs(m.vaz); }
+      }
+      m.d -= m.speed * dt;
+      if (m.d <= 1.3) {                         // bite
+        mozzies.splice(i, 1);
+        lives--; hurt = 1; buzz([120, 60, 120]); tone(220, 70, .35, .3, 'square');
+        updateHud();
+        if (lives <= 0) { gameOver(); return; }
+        continue;
+      }
+      project(m);
+      if (!nearest || m.d < nearest.d) nearest = m;
+    }
+    // buzz follows the nearest mosquito
+    if (buzzGain) {
+      if (nearest) {
+        const v = nearest.v, len = Math.hypot(v[0], v[1], v[2]) || 1;
+        buzzGain.gain.setTargetAtTime(Math.min(.22, .5 / (nearest.d * nearest.d) + .015), ac.currentTime, .08);
+        buzzOsc.frequency.setTargetAtTime(480 + 400 / nearest.d, ac.currentTime, .1);
+        if (buzzPan) buzzPan.pan.setTargetAtTime(Math.max(-1, Math.min(1, v[0] / len * 1.4)), ac.currentTime, .08);
+      } else buzzGain.gain.setTargetAtTime(0, ac.currentTime, .1);
+    }
+  }
+
+  function shoot(px, py) {
+    if (state !== 'play') return;
+    const now = performance.now();
+    if (now - lastShot < 220) return;
+    lastShot = now; shots++; flash = 1; recoil = 1;
+    noise(.16, 2400, .5); tone(900, 120, .1, .18, 'square');
+    const ax = gyro ? W / 2 : px, ay = gyro ? H / 2 : py;
+    let hit = null;
+    for (const m of mozzies) {
+      if (!m.on) continue;
+      const r = Math.max(m.sr * 1.25, 42);
+      if (Math.hypot(m.sx - ax, m.sy - ay) <= r && (!hit || m.d < hit.d)) hit = m;
+    }
+    if (hit) {
+      mozzies.splice(mozzies.indexOf(hit), 1);
+      hits++;
+      const pts = 10 + Math.round(hit.d * 3) + wave * 2;      // far shots score more
+      score += pts; updateHud(); buzz(35);
+      tone(300, 60, .18, .3, 'triangle'); noise(.12, 700, .5);
+      const blobs = [];
+      for (let i = 0; i < 9; i++) blobs.push({ a: rand(0, TAU), r: rand(.3, 1.5), s: rand(.15, .5) });
+      splats.push({ x: hit.sx, y: hit.sy, r: Math.max(18, hit.sr), life: 1, blobs });
+      floats.push({ x: hit.sx, y: hit.sy, txt: '+' + pts, life: 1 });
+    }
+  }
+
+  // ---------- drawing ----------
+  function drawMosquito(m) {
+    const s = m.sr, flap = Math.sin(m.t * 70);
+    ctx.save();
+    ctx.translate(m.sx + Math.sin(m.t * 9) * s * .12, m.sy + Math.cos(m.t * 11) * s * .12);
+    ctx.rotate(Math.sin(m.t * 2.3) * .35);
+    ctx.lineCap = 'round';
+    // legs
+    ctx.strokeStyle = '#1c1410'; ctx.lineWidth = Math.max(1, s * .05);
+    for (const side of [-1, 1]) for (let k = 0; k < 3; k++) {
+      const bx = side * s * .12, by = -s * .15 + k * s * .18;
+      ctx.beginPath(); ctx.moveTo(bx, by);
+      ctx.lineTo(side * s * (.75 + k * .1), by - s * .25 + k * s * .3);
+      ctx.lineTo(side * s * (.95 + k * .12), by + s * .35 + k * s * .35);
+      ctx.stroke();
+    }
+    // wings
+    ctx.fillStyle = 'rgba(225,240,255,.45)'; ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = 1;
+    for (const side of [-1, 1]) {
+      ctx.save(); ctx.translate(side * s * .1, -s * .2); ctx.rotate(side * (1.0 + flap * .35));
+      ctx.beginPath(); ctx.ellipse(0, -s * .6, s * .2, s * .65, 0, 0, TAU); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+    // abdomen (striped), thorax, head
+    ctx.fillStyle = '#3a2a20';
+    ctx.beginPath(); ctx.ellipse(0, s * .45, s * .17, s * .6, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#8a6a4a'; ctx.lineWidth = Math.max(1, s * .04);
+    for (let k = 0; k < 4; k++) { const y = s * (.15 + k * .2); ctx.beginPath(); ctx.moveTo(-s * .14, y); ctx.lineTo(s * .14, y); ctx.stroke(); }
+    ctx.fillStyle = '#241812';
+    ctx.beginPath(); ctx.ellipse(0, -s * .2, s * .23, s * .27, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, -s * .55, s * .15, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#c0392b';
+    ctx.beginPath(); ctx.arc(-s * .09, -s * .58, s * .06, 0, TAU); ctx.arc(s * .09, -s * .58, s * .06, 0, TAU); ctx.fill();
+    // proboscis + antennae
+    ctx.strokeStyle = '#1c1410'; ctx.lineWidth = Math.max(1, s * .045);
+    ctx.beginPath(); ctx.moveTo(0, -s * .68); ctx.lineTo(0, -s * 1.15); ctx.stroke();
+    ctx.lineWidth = Math.max(1, s * .025);
+    ctx.beginPath(); ctx.moveTo(-s * .05, -s * .68); ctx.lineTo(-s * .3, -s * .95);
+    ctx.moveTo(s * .05, -s * .68); ctx.lineTo(s * .3, -s * .95); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawPointer(m) {       // arrow toward an off-screen mosquito
+    const v = m.v; let a = Math.atan2(-v[1], v[0]);
+    const rad = Math.min(W, H) * .36, x = W / 2 + Math.cos(a) * rad, y = H / 2 + Math.sin(a) * rad;
+    const urgent = m.d < 4, pulse = urgent ? .6 + .4 * Math.sin(performance.now() / 80) : .85;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(a);
+    ctx.fillStyle = urgent ? `rgba(255,80,60,${pulse})` : `rgba(255,216,74,${pulse})`;
+    ctx.beginPath(); ctx.moveTo(16, 0); ctx.lineTo(-10, -12); ctx.lineTo(-4, 0); ctx.lineTo(-10, 12); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function draw(dt) {
+    ctx.clearRect(0, 0, W, H);
+    if (state !== 'play') return;
+
+    // splats stay on the "lens" briefly
+    for (let i = splats.length - 1; i >= 0; i--) {
+      const s = splats[i]; s.life -= dt * .8;
+      if (s.life <= 0) { splats.splice(i, 1); continue; }
+      ctx.fillStyle = `rgba(150,20,25,${Math.min(1, s.life * 1.5) * .85})`;
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r * .55, 0, TAU); ctx.fill();
+      for (const b of s.blobs) { ctx.beginPath(); ctx.arc(s.x + Math.cos(b.a) * s.r * b.r, s.y + Math.sin(b.a) * s.r * b.r, s.r * b.s, 0, TAU); ctx.fill(); }
+    }
+
+    mozzies.sort((a, b) => b.d - a.d);
+    let aimed = false;
+    for (const m of mozzies) {
+      if (m.on) {
+        drawMosquito(m);
+        if (gyro && Math.hypot(m.sx - W / 2, m.sy - H / 2) <= Math.max(m.sr * 1.25, 42)) aimed = true;
+      } else if (gyro) drawPointer(m);
+    }
+
+    for (let i = floats.length - 1; i >= 0; i--) {
+      const f = floats[i]; f.life -= dt * 1.2; f.y -= 50 * dt;
+      if (f.life <= 0) { floats.splice(i, 1); continue; }
+      ctx.globalAlpha = f.life; ctx.fillStyle = '#ffd84a'; ctx.font = '800 26px system-ui';
+      ctx.textAlign = 'center'; ctx.fillText(f.txt, f.x, f.y); ctx.globalAlpha = 1;
+    }
+
+    // crosshair (gyro mode aims with the phone)
+    if (gyro) {
+      const cx = W / 2, cy = H / 2 - recoil * 14, r = 30;
+      ctx.strokeStyle = aimed ? '#ff5a45' : 'rgba(255,255,255,.9)'; ctx.lineWidth = 3;
+      ctx.shadowColor = '#000'; ctx.shadowBlur = 4;
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU);
+      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) { ctx.moveTo(cx + dx * (r - 9), cy + dy * (r - 9)); ctx.lineTo(cx + dx * (r + 12), cy + dy * (r + 12)); }
+      ctx.stroke(); ctx.shadowBlur = 0;
+      ctx.fillStyle = ctx.strokeStyle; ctx.beginPath(); ctx.arc(cx, cy, 3, 0, TAU); ctx.fill();
+    }
+
+    if (waveBanner > 0) {
+      waveBanner -= dt;
+      ctx.globalAlpha = Math.min(1, waveBanner); ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
+      ctx.shadowColor = '#000'; ctx.shadowBlur = 8;
+      ctx.font = '800 44px system-ui'; ctx.fillText('Wave ' + wave, W / 2, H * .3);
+      ctx.font = '600 17px system-ui';
+      ctx.fillText(gyro ? 'Turn around to find them · tap to shoot' : 'Tap the mosquitoes', W / 2, H * .3 + 32);
+      ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    }
+    if (flash > 0) { ctx.fillStyle = `rgba(255,245,200,${flash * .25})`; ctx.fillRect(0, 0, W, H); flash -= dt * 9; }
+    if (hurt > 0) {
+      const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * .25, W / 2, H / 2, Math.max(W, H) * .7);
+      g.addColorStop(0, 'rgba(200,0,0,0)'); g.addColorStop(1, `rgba(200,0,0,${hurt * .75})`);
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); hurt -= dt * 1.3;
+    }
+    if (recoil > 0) recoil = Math.max(0, recoil - dt * 8);
+  }
+
+  let last = performance.now();
+  function frame(t) {
+    const dt = Math.min(.05, (t - last) / 1000); last = t;
+    update(dt); draw(dt);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ---------- startup ----------
+  let ready = false;
+  async function begin() {
+    initAudio();
+    if (!ready) {
+      $('note').textContent = 'Starting camera…';
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        cam.srcObject = stream; await cam.play().catch(() => {});
+      } catch (e) {
+        $('note').textContent = 'No camera — playing on a plain background.';
+      }
+      try {
+        if (window.DeviceOrientationEvent && DeviceOrientationEvent.requestPermission) await DeviceOrientationEvent.requestPermission();
+      } catch (e) {}
+      addEventListener('deviceorientation', onOrient);
+      await new Promise(r => setTimeout(r, 500));     // give the sensor a moment to report
+      try { if (screen.orientation && screen.orientation.lock) screen.orientation.lock('portrait').catch(() => {}); } catch (e) {}
+      try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {}
+      ready = true;
+    }
+    startGame();
+  }
+  $('play').addEventListener('click', begin);
+  $('again').addEventListener('click', begin);
+  cv.addEventListener('pointerdown', e => { e.preventDefault(); shoot(e.clientX, e.clientY); });
+  // Leaving the app: end the round, silence the buzz and release the camera.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (state === 'play') gameOver();
+      if (cam.srcObject) { cam.srcObject.getTracks().forEach(t => t.stop()); cam.srcObject = null; }
+      ready = false;
+      if (ac) ac.suspend();
+    } else if (ac) ac.resume();
+  });
+  // Offline cache only for the web version; the Android app ships the files itself.
+  if ('serviceWorker' in navigator && location.hostname.endsWith('github.io'))
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+})();
+</script>
+</body>
+</html>
